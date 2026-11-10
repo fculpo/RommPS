@@ -2066,9 +2066,10 @@ grep -q "Cut Short (USA).sfc cut off at 100000 bytes" "$T/daemon.log" || fail "n
 cut_file=$(find "$T" -name 'Cut Short (USA).sfc' -not -path '*/data/*' | head -1)
 [[ "$(wc -c < "$cut_file")" == 300000 && "$(tr -d Z < "$cut_file" | wc -c)" == 0 ]] || fail "the carried-on download must be whole: $cut_file $(wc -c < "$cut_file")"
 # A big one goes over several connections at once, in pieces (#39: the PS5
-# holds each connection to 512 KB in flight); one cut off halfway carries on
-# from where the file stops being whole (the cut skips the first answer, the
-# one that says how big the file is), and every byte lands in its place.
+# holds each connection to 512 KB in flight); a piece cut off halfway is asked
+# again from where it stopped, by itself, without the whole download starting
+# over (the cut skips the first answer, the one that says how big the file
+# is), and every byte lands in its place.
 python3 -c "import json,sys; json.dump({'id': 954, 'platform_id': 1, 'name': 'Big One', 'fs_name': 'Big One (USA).sfc',
   'files': [{'id': 9541, 'file_name': 'Big One (USA).sfc', 'content': ''.join('%015d\n' % i for i in range(5 * 2**20))}]},
   open(sys.argv[1], 'w'))" "$T/big.json"
@@ -2078,7 +2079,9 @@ post /api/download '{"rom_id":954,"name":"Big One"}' >/dev/null
 s=$(waitjob 954 done)
 [[ "$s" == done* ]] || fail "a big download cut off halfway must carry on: $s
 $(grep -E 'Big One|cut off' "$T/daemon.log" | tail -5)"
-grep -q "Big One (USA).sfc cut off at" "$T/daemon.log" || fail "no log of the big download carrying on"
+grep -qE "piece [0-9]+ of .*Big One.* cut off at [0-9]+ bytes .*: asking again" "$T/daemon.log" || fail "no log of the piece asked again
+$(grep -E 'Big One|cut off' "$T/daemon.log" | tail -5)"
+! grep -q "download of Big One (USA).sfc cut off at" "$T/daemon.log" || fail "a piece cut off must not start the whole download over"
 grep -qE "downloaded [0-9.]+ MB in .* over [2-9] connections" "$T/daemon.log" || fail "a big download must go over several connections
 $(grep -E 'downloaded' "$T/daemon.log" | tail -3)"
 big=$(find "$T" -name 'Big One (USA).sfc' -not -path '*/data/*' | head -1)

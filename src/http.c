@@ -675,11 +675,12 @@ static int xfer_cb(void *ud, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ul
  * its memory being tight. */
 #define PAR_CONNS 6
 #define PAR_PIECE ((int64_t)16 * 1024 * 1024)
+#define PAR_TRIES 3 /* a piece's tries in a row that get nothing more */
 
 static int par_conns(void) { return strcmp(plat_info()->name, "ps4") ? PAR_CONNS : 1; }
 
 typedef struct {
-    const char *url, *auth;
+    const char *url, *auth, *name; /* name: the file's, for the log */
     int verify, client, fd;
     int64_t base, total; /* where the pieces start (what the .part had), the file's size */
     int npieces, next;   /* next: the first piece no connection took yet */
@@ -753,12 +754,28 @@ static void *par_conn_run(void *arg) {
         w->piece = i;
         w->at = d->base + (int64_t)i * PAR_PIECE;
         w->end = w->at + piece_len(d, i);
-        char range[48];
-        snprintf(range, sizeof range, "%lld-%lld", (long long)w->at, (long long)w->end - 1);
-        curl_easy_setopt(w->c, CURLOPT_RANGE, range);
-        CURLcode rc = curl_easy_perform(w->c);
-        if (rc == CURLE_OK && w->at == w->end) continue;
-        if (rc == CURLE_OK) rc = CURLE_PARTIAL_FILE; /* the server stopped short */
+        CURLcode rc;
+        /* A piece cut off is asked again from where it stopped, by itself:
+         * with six at once, a dropped connection would otherwise start the
+         * whole download over. Not when the server refused it or isn't
+         * there, nor for one stopped on purpose (par_xfer). */
+        for (int fails = 0;;) {
+            const int64_t before = w->at;
+            char range[48];
+            snprintf(range, sizeof range, "%lld-%lld", (long long)w->at, (long long)w->end - 1);
+            curl_easy_setopt(w->c, CURLOPT_RANGE, range);
+            rc = curl_easy_perform(w->c);
+            if (rc == CURLE_OK && w->at == w->end) break;
+            if (rc == CURLE_OK) rc = CURLE_PARTIAL_FILE; /* the server stopped short */
+            fails = w->at > before ? 0 : fails + 1;
+            if (fails == PAR_TRIES || rc == CURLE_HTTP_RETURNED_ERROR || rc == CURLE_ABORTED_BY_CALLBACK ||
+                no_answer(w->c, rc))
+                break;
+            LOGI("piece %d of %s cut off at %lld bytes (%s): asking again", i, d->name, (long long)w->at,
+                 errbuf[0] ? errbuf : curl_easy_strerror(rc));
+            sleep(1);
+        }
+        if (rc == CURLE_OK) continue;
         if (!__atomic_load_n(&d->stop, __ATOMIC_RELAXED)) { /* not the user's stop */
             pthread_mutex_lock(&d->lock);
             const int first = !d->failed;
@@ -816,7 +833,7 @@ static int par_download(const char *url, const char *auth, const char *dest, con
     char par[PATH_MAX_LEN];
     snprintf(par, sizeof par, "%s.par.part", dest);
     const int fd = rename(part, par) == 0 ? open(par, O_WRONLY) : -1;
-    par_dl d = {.url = url, .auth = auth, .verify = verify, .client = client, .fd = fd, .base = offset,
+    par_dl d = {.url = url, .auth = auth, .name = path_basename(dest), .verify = verify, .client = client, .fd = fd, .base = offset,
                 .total = total};
     d.npieces = d.cut = (int)((total - offset + PAR_PIECE - 1) / PAR_PIECE);
     d.written = fd >= 0 ? calloc((size_t)d.npieces, sizeof *d.written) : NULL;
